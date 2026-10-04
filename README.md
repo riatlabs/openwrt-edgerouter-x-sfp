@@ -2,7 +2,8 @@
 
 Moves an Ubiquiti EdgeRouter X SFP from **EdgeOS** (tested: 1.10.11, 2.0.6,
 2.0.9) to **current OpenWrt (25.12)** over SSH only: no TFTP, no serial console, no local
-re-cabling, one final flash instead of the 18.06 → 22.03 → 24.10 chain. It is
+re-cabling. EdgeOS first flashes the 19.07 RAM bridge; the bridge then flashes
+OpenWrt 25.12, avoiding the 18.06 → 22.03 → 24.10 upgrade chain. It is
 meant for an operator who reaches many routers remotely, one at a time. It is
 not unattended: every step is started by hand and asks before it writes.
 
