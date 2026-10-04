@@ -31,7 +31,8 @@ not unattended: every step is started by hand and asks before it writes.
    the boot selector, and the root filesystem in place of EdgeOS's. Every
    write is read back before the next one starts.
 4. **OpenWrt 25.12 boots.** On its first boot it applies `access.tgz`, so it
-   is reachable again over IPv6 link-local on `eth0` with your SSH keys.
+   is reachable again over IPv6 link-local on `eth0` with the public keys you
+   supplied to `access-config`.
    From now on it is a normal OpenWrt: later updates use plain `sysupgrade`.
 
 ## Why this approach (and not the others)
@@ -61,6 +62,10 @@ not unattended: every step is started by hand and asks before it writes.
   or your own from `build/build.sh final` (adds OLSR v1/v2).
 - An `access.tgz` with your SSH public keys (next section).
 
+The bridge accepts `root` with the password supplied to `build.sh bridge`.
+There is no built-in `admin` password. The final OpenWrt installation uses
+the keys in `access.tgz` and disables SSH password login.
+
 ## Migrating one router
 
 ```sh
@@ -86,6 +91,13 @@ not unattended: every step is started by hand and asks before it writes.
 #    in its own known_hosts file under ~/.cache/erx-migrate/)
 ./erx-migrate verify 'root@fe80::211:22ff:fe33:4455%eth0' sysupgrade.bin
 ```
+
+`~/.ssh/admins.pub` must contain one or more SSH **public** keys, one per line
+in `authorized_keys` format. For one key, you can create it with
+`cp ~/.ssh/id_ed25519.pub ~/.ssh/admins.pub`. `access-config` puts those keys
+in `etc/dropbear/authorized_keys` inside `access.tgz`; `flash --config`
+transfers the archive for restoration on OpenWrt's first boot. Keep the
+private key on your host.
 
 Find a router's link-local address with `ping -6 ff02::1%eth0`. After each
 reboot give the router a minute or two before the next step; the first boot
@@ -177,7 +189,7 @@ bzip2 patch perl openssl`).
 
 ```sh
 cd build
-printf '%s\n' 'bridge-password' | ./build.sh bridge [--authorized-keys keys.pub]
+printf '%s\n' 'your-chosen-bridge-password' | ./build.sh bridge [--authorized-keys keys.pub]
 ./build.sh final       # optional: your own 25.12 image with OLSR v1/v2
 ./build.sh recovery    # only for the lab restore in recovery/
 ```

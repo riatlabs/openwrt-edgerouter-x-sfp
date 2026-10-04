@@ -50,7 +50,7 @@ if [[ "$KIND" == bridge ]]; then
     fi
     [[ -z "${AUTHORIZED_KEYS}" && "${1:-}" != "" ]] && die "unknown argument: $1"
     command -v openssl >/dev/null || die "missing tool: openssl"
-    [[ ! -t 0 ]] || die "pipe the bridge root password on stdin, e.g. printf '%s\n' admin | ./build.sh bridge"
+    [[ ! -t 0 ]] || die "pipe your chosen bridge root password on stdin, e.g. printf '%s\n' chosen-password | ./build.sh bridge"
     IFS= read -r password || true
     [[ -n "$password" ]] || die "empty bridge root password"
     # OpenWrt 19.07's size-optimised musl only verifies MD5-crypt hashes.
