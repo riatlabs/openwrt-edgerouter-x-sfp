@@ -4,8 +4,9 @@ Moves an Ubiquiti EdgeRouter X SFP from **EdgeOS** (tested: 1.10.11, 2.0.6,
 2.0.9) to **current OpenWrt (25.12)** over SSH only: no TFTP, no serial console, no local
 re-cabling. EdgeOS first flashes the 19.07 RAM bridge; the bridge then flashes
 OpenWrt 25.12, avoiding the 18.06 → 22.03 → 24.10 upgrade chain. It is
-meant for an operator who reaches many routers remotely, one at a time. It is
-not unattended: every step is started by hand and asks before it writes.
+meant for an operator who reaches many routers remotely, one at a time. Each
+step is started by hand. `bridge` writes the bridge image when invoked and
+asks before rebooting; `flash` asks before erasing EdgeOS.
 
 ## How it works
 
@@ -22,7 +23,8 @@ not unattended: every step is started by hand and asks before it writes.
 1. **EdgeOS installs a tiny OpenWrt 19.07 image** through its own firmware
    updater (`add system image`). This works because the bridge is built in
    EdgeOS's factory format with a kernel that fits one 3 MiB EdgeOS kernel
-   slot. EdgeOS switches its boot selector to it and reboots.
+   slot. EdgeOS switches its boot selector to it; the tool then asks before
+   rebooting.
 2. **The bridge boots and runs entirely from RAM.** Nothing on flash is in
    use, so the whole flash can be rewritten safely. It answers on IPv6
    link-local on the WAN port (`eth0`) as `root`.
@@ -30,9 +32,9 @@ not unattended: every step is started by hand and asks before it writes.
    across both old slots (OpenWrt ≥ 24.10 needs one 6 MiB kernel partition),
    the boot selector, and the root filesystem in place of EdgeOS's. Every
    write is read back before the next one starts.
-4. **OpenWrt 25.12 boots.** On its first boot it applies `access.tgz`, so it
-   is reachable again over IPv6 link-local on `eth0` with the public keys you
-   supplied to `access-config`.
+4. **OpenWrt 25.12 boots.** If `flash` received `--config access.tgz`, OpenWrt
+   applies the archive on its first boot. It then accepts the public keys you
+   supplied to `access-config` over IPv6 link-local on `eth0`.
    From now on it is a normal OpenWrt: later updates use plain `sysupgrade`.
 
 ## Why this approach (and not the others)
@@ -63,8 +65,8 @@ not unattended: every step is started by hand and asks before it writes.
 - An `access.tgz` with your SSH public keys (next section).
 
 The bridge accepts `root` with the password supplied to `build.sh bridge`.
-There is no built-in `admin` password. The final OpenWrt installation uses
-the keys in `access.tgz` and disables SSH password login.
+There is no built-in `admin` password. With `--config access.tgz`, the final
+OpenWrt installation uses its keys and disables SSH password login.
 
 ## Migrating one router
 
@@ -78,7 +80,7 @@ the keys in `access.tgz` and disables SSH password login.
 # 1. read-only: is this an ER-X-SFP with a healthy flash?
 ./erx-migrate check  'ubnt@fe80::211:22ff:fe33:4455%eth0'
 
-# 2. install the bridge through EdgeOS and reboot into it (asks: REBOOT)
+# 2. install the bridge through EdgeOS; REBOOT confirms only the reboot
 ./erx-migrate bridge 'ubnt@fe80::211:22ff:fe33:4455%eth0' bridge.tar
 
 # 3. from the bridge: write OpenWrt and reboot (asks: FLASH)
@@ -86,18 +88,23 @@ the keys in `access.tgz` and disables SSH password login.
 #    address differs from EdgeOS's (...4456 instead of ...4455 here)
 ./erx-migrate flash  'root@fe80::211:22ff:fe33:4456%eth0' sysupgrade.bin --config access.tgz
 
-# 4. read-only: is it OpenWrt with the new layout? does sysupgrade -T accept
+# 4. no flash writes: is it OpenWrt with the new layout? does sysupgrade -T accept
 #    the next image? (the router has a new SSH host key now; verify keeps it
 #    in its own known_hosts file under ~/.cache/erx-migrate/)
 ./erx-migrate verify 'root@fe80::211:22ff:fe33:4455%eth0' sysupgrade.bin
 ```
 
+`bridge.tar` and `sysupgrade.bin` are local image paths to replace with your
+actual files. `build.sh` puts its images under `build/out/`; an official
+sysupgrade image can also be used.
+
 `~/.ssh/admins.pub` must contain one or more SSH **public** keys, one per line
-in `authorized_keys` format. For one key, you can create it with
-`cp ~/.ssh/id_ed25519.pub ~/.ssh/admins.pub`. `access-config` puts those keys
-in `etc/dropbear/authorized_keys` inside `access.tgz`; `flash --config`
+in `authorized_keys` format. If you already have an ed25519 public key, you
+can use `cp ~/.ssh/id_ed25519.pub ~/.ssh/admins.pub`. `access-config` puts
+those keys in `etc/dropbear/authorized_keys` inside `access.tgz`; `flash --config`
 transfers the archive for restoration on OpenWrt's first boot. Keep the
-private key on your host.
+private key on your host. For remote access after migration, pass this archive
+with `--config` when running `flash`.
 
 Find a router's link-local address with `ping -6 ff02::1%eth0`. After each
 reboot give the router a minute or two before the next step; the first boot
@@ -111,7 +118,7 @@ on the bridge runs detached from the SSH session and logs to
 `/tmp/erx-flash.log`, so a dropped connection does not stop it half-way;
 `flash` reports success only when the writer has printed its final line.
 
-### What each step checks before it writes
+### Checks before flash writes
 
 | Step | Refuses when |
 |---|---|
