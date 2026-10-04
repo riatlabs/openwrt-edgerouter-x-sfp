@@ -1,0 +1,27 @@
+# OpenWrt 19.07.10 RAM bridge for the EdgeRouter X SFP (build.sh bridge).
+#
+# EdgeOS installs this as a system image, so its kernel must fit one 3 MiB
+# EdgeOS kernel slot; build.sh fails otherwise. It carries nothing but what
+# the migration needs: SSH, the MTD/UBI tools and OpenWrt's upgrade helpers.
+
+CONFIG_TARGET_ramips=y
+CONFIG_TARGET_ramips_mt7621=y
+# OpenWrt 19.07 uses the legacy hyphenated device name.
+CONFIG_TARGET_ramips_mt7621_DEVICE_ubnt-erx-sfp=y
+CONFIG_TARGET_ROOTFS_INITRAMFS=y
+CONFIG_TARGET_ROOTFS_SQUASHFS=y
+# Root login over IPv6 link-local (see bridge-access.sh). ECC lets Dropbear
+# 2019.78 use ECDSA keys; it has no ed25519.
+CONFIG_PACKAGE_dropbear=y
+CONFIG_DROPBEAR_ECC=y
+# Keep the old-layout bridge under the 3 MiB kernel-slot limit. These debug
+# features are not needed for the transport/migration stage and materially
+# increase the compressed initramfs kernel.
+# CONFIG_KERNEL_DEBUG_KERNEL is not set
+# CONFIG_KERNEL_DEBUG_INFO is not set
+# CONFIG_KERNEL_KALLSYMS is not set
+# CONFIG_KERNEL_CRASHLOG is not set
+# CONFIG_KERNEL_SWAP is not set
+# CONFIG_KERNEL_DEBUG_FS is not set
+# CONFIG_KERNEL_MAGIC_SYSRQ is not set
+# CONFIG_KERNEL_PRINTK_TIME is not set

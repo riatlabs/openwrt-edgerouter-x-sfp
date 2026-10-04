@@ -1,0 +1,12 @@
+# OpenWrt 25.12.5 RAM recovery image for the EdgeRouter X SFP (build.sh recovery).
+#
+# Booted from U-Boot over TFTP (serial console) to run recovery/restore_edgeos.sh.
+# The official initramfs lacks nand-utils, which the restore needs to rewrite
+# the boot-selector erase block; ubi-utils are listed to make the contract explicit.
+
+CONFIG_TARGET_ramips=y
+CONFIG_TARGET_ramips_mt7621=y
+CONFIG_TARGET_ramips_mt7621_DEVICE_ubnt_edgerouter-x-sfp=y
+CONFIG_TARGET_ROOTFS_INITRAMFS=y
+CONFIG_PACKAGE_ubi-utils=y
+CONFIG_PACKAGE_nand-utils=y

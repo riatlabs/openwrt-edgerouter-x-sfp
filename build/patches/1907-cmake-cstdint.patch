@@ -1,0 +1,8 @@
+--- a/Source/cmWorkerPool.h
++++ b/Source/cmWorkerPool.h
+@@ -8,6 +8,7 @@
+ #include "cmAlgorithms.h" // IWYU pragma: keep
+ 
+ #include <memory> // IWYU pragma: keep
++#include <cstdint>
+ #include <stdint.h>

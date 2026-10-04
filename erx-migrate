@@ -1,0 +1,566 @@
+#!/usr/bin/env python3
+"""erx-migrate -- move a remote EdgeRouter X SFP from EdgeOS to current OpenWrt.
+
+Runs on a Linux host and talks to the router only over SSH. No TFTP, no
+serial console. Each step is started by hand; nothing runs unattended.
+
+  erx-migrate check   ubnt@ROUTER                 # EdgeOS, read-only
+  erx-migrate bridge  ubnt@ROUTER bridge.tar      # EdgeOS -> 19.07 RAM bridge
+  erx-migrate flash   root@ROUTER sysupgrade.bin [--config access.tgz]
+  erx-migrate verify  root@ROUTER [sysupgrade.bin] # the new OpenWrt
+  erx-migrate access-config --authorized-keys FILE -o access.tgz
+
+ROUTER is whatever ssh accepts, e.g. fe80::211:22ff:fe33:4455%eth0.
+See README.md for the full procedure and what each step writes.
+"""
+
+import argparse
+import hashlib
+import io
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tarfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+FLASH_SCRIPT = HERE / "target" / "erx-flash.sh"
+FLASH_DONE = "all writes verified; rebooting into OpenWrt"   # last line of a good flash
+MIB = 1024 * 1024
+KERNEL_SLOT = 3 * 1024 * 1024          # one EdgeOS kernel slot: 3 MiB
+CONFIG_LIMIT = 4 * MIB                  # access.tgz is staged in the bridge's RAM
+STATE = Path(os.environ.get("ERX_STATE_DIR", Path.home() / ".cache" / "erx-migrate"))
+
+
+# --------------------------------------------------------------------- ssh
+
+class Router:
+    """One SSH master connection per router, so a password is asked once."""
+
+    def __init__(self, destination: str, known_hosts: Path | None = None):
+        self.destination = destination
+        self.known_hosts = known_hosts
+        STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.options = [
+            "-o", "ControlMaster=auto",
+            "-o", f"ControlPath={socket_dir()}/%C",
+            "-o", "ControlPersist=300",
+            "-o", "LogLevel=ERROR",
+            "-o", "ServerAliveInterval=5",
+            "-o", "ServerAliveCountMax=12",   # 60 s: the bridge is slow during NAND work
+            # EdgeOS 1.x (OpenSSH 6.0) and the bridge (Dropbear 2019.78) sign RSA
+            # only with SHA-1, which OpenSSH >= 8.8 no longer offers by default.
+            "-o", "PubkeyAcceptedKeyTypes=+ssh-rsa",
+        ]
+        if known_hosts:  # a RAM bridge gets a new host key on every boot
+            self.options += ["-o", f"UserKnownHostsFile={known_hosts}",
+                             "-o", "StrictHostKeyChecking=accept-new"]
+            # A master left over from the previous system would skip the
+            # host-key exchange entirely; start from a fresh connection.
+            subprocess.run(["ssh", *self.options, "-O", "exit", destination],
+                           stdin=subprocess.DEVNULL, capture_output=True)
+
+    def run(self, command: str, *, check: bool = True, stdin=subprocess.DEVNULL) -> str:
+        # ssh must not read our stdin: it carries the typed confirmations.
+        # Password prompts go to the terminal (/dev/tty), not stdin.
+        result = subprocess.run(["ssh", *self.options, self.destination, command],
+                                stdin=stdin, capture_output=True, text=True)
+        if check and result.returncode != 0:
+            if "REMOTE HOST IDENTIFICATION HAS CHANGED" in result.stderr:
+                host = self.destination.split("@")[-1]
+                where = f"-f '{self.known_hosts}' " if self.known_hosts else ""
+                sys.exit(f"{self.destination} presents a different SSH host key than the one you "
+                         f"stored (reinstalled or a different router?). Check it, then remove the "
+                         f"old entry with: ssh-keygen {where}-R '{host}'")
+            sys.exit(f"remote command failed ({result.returncode}): {command}\n{result.stderr}")
+        return result.stdout
+
+    def stream(self, command: str) -> tuple[int, str]:
+        """Run with output shown live; returns the exit code and the output."""
+        process = subprocess.Popen(["ssh", *self.options, self.destination, command],
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True)
+        output = []
+        for line in process.stdout:
+            print(line, end="", flush=True)
+            output.append(line)
+        return process.wait(), "".join(output)
+
+    def upload(self, local: Path, remote: str) -> None:
+        with open(local, "rb") as data:
+            self.run(f"cat > {shlex.quote(remote)}", stdin=data)
+        remote_hash = self.run(f"sha256sum {shlex.quote(remote)}").split()[0]
+        if remote_hash != sha256(local):
+            sys.exit(f"upload of {local.name} arrived damaged (hash mismatch)")
+        print(f"uploaded {local.name} -> {remote} ({remote_hash[:16]}...)")
+
+
+def socket_dir() -> Path:
+    """Unix socket paths are limited to ~104 bytes; %C adds 40 characters.
+    The directory holds live SSH master sockets, so it must be private."""
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if len(str(STATE)) <= 50:
+        path = STATE
+    elif runtime and len(runtime) <= 40:
+        path = Path(runtime) / "erx-migrate"
+    else:
+        path = Path(f"/tmp/erx-migrate-{os.getuid()}")
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if path.stat().st_uid != os.getuid():
+        sys.exit(f"{path} belongs to another user; remove it or set ERX_STATE_DIR")
+    path.chmod(0o700)
+    return path
+
+
+def sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def confirm(word: str, question: str, cancelled: str = "cancelled, nothing was changed") -> None:
+    try:
+        answer = input(f"{question}\nType {word} to continue: ")
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
+    if answer.strip() != word:
+        sys.exit(cancelled)
+
+
+# ------------------------------------------------------------------ EdgeOS
+
+EDGEOS_FACTS = r"""
+echo "board=$(/usr/sbin/ubnt-hal-e getBoardIdE 2>/dev/null)"
+echo "version=$(cat /etc/version)"
+mtd_index() { awk -v n="\"$1\"" '$4 == n { sub(/^mtd/, "", $1); sub(/:$/, "", $1); print $1 }' /proc/mtd; }
+for name in eeprom Kernel1 Kernel2 RootFS; do
+    idx=$(mtd_index $name)
+    # EdgeOS 1.x calls the first kernel slot "Kernel", 2.x "Kernel1".
+    [ -z "$idx" ] && [ $name = Kernel1 ] && idx=$(mtd_index Kernel)
+    echo "mtd_$name=$idx"
+    [ -n "$idx" ] && [ $name != RootFS ] || continue
+    # nanddump reads the whole partition and prints the driver's counters;
+    # EdgeOS 1.x (Linux 3.10) has no bad_blocks/ecc_failures in sysfs.
+    out=$(LC_ALL=C sudo -n nanddump --bb=dumpbad -f /dev/null /dev/mtd$idx 2>&1)
+    echo "bad_$name=$(printf '%s\n' "$out" | sed -n 's/^Number of bad blocks: //p')"
+    echo "ecc_$name=$(printf '%s\n' "$out" | sed -n 's/^ECC failed: //p')"
+done
+# PoE outputs EdgeOS switches on (OpenWrt starts with all of them off).
+# An unreadable config.boot must not look like "no PoE".
+if sudo -n test -s /config/config.boot; then echo "config_boot=ok"; fi
+echo "poe_on=$(sudo -n cat /config/config.boot 2>/dev/null | awk '
+    $1 == "ethernet" && $2 ~ /^eth[0-9]$/ { port = $2 }
+    $1 == "poe" && $2 == "{" { in_poe = 1; next }
+    in_poe && $1 == "output" && $2 != "off" { printf "%s ", port }
+    in_poe && $1 == "}" { in_poe = 0 }')"
+idx=$(mtd_index eeprom)
+echo "selector=$(sudo -n hexdump -s 160 -n 1 -e '1/1 "%02x"' /dev/mtdblock$idx 2>/dev/null)"
+"""
+
+
+def edgeos_facts(router: Router) -> dict[str, str]:
+    lines = router.run(EDGEOS_FACTS).splitlines()
+    return dict(line.split("=", 1) for line in lines if "=" in line)
+
+
+def edgeos_problems(facts: dict[str, str]) -> list[str]:
+    problems = []
+    if facts.get("board") != "e51":
+        problems.append(f"board is '{facts.get('board')}', expected e51 (ER-X-SFP)")
+    for name in ("eeprom", "Kernel1", "Kernel2", "RootFS"):
+        if not facts.get(f"mtd_{name}"):
+            problems.append(f"MTD partition {name} missing: not the EdgeOS flash layout")
+    if not any(facts.get(f"bad_{name}") for name in ("eeprom", "Kernel1", "Kernel2")):
+        problems.append("no NAND counters at all: the EdgeOS user needs passwordless sudo (sudo -n)")
+    for name in ("eeprom", "Kernel1", "Kernel2"):
+        if facts.get(f"bad_{name}") != "0":
+            problems.append(f"{name}: bad blocks = '{facts.get(f'bad_{name}')}' (need 0)")
+        if facts.get(f"ecc_{name}") != "0":
+            problems.append(f"{name}: ECC failures = '{facts.get(f'ecc_{name}')}' (need 0)")
+    if facts.get("config_boot") != "ok":
+        problems.append("cannot read /config/config.boot, so the PoE state is unknown")
+    if facts.get("poe_on", "").strip():
+        problems.append(f"PoE output is on for {facts['poe_on'].strip()}: it goes off from the bridge "
+                        "reboot until OpenWrt is configured to switch it on (README, 'PoE')")
+    if facts.get("selector") not in ("00", "01"):
+        problems.append(f"boot selector unreadable or unexpected: '{facts.get('selector')}'")
+    return problems
+
+
+def cmd_check(args) -> None:
+    router = Router(args.router)
+    facts = edgeos_facts(router)
+    for key in ("version", "board", "selector"):
+        print(f"{key:12} {facts.get(key)}")
+    problems = edgeos_problems(facts)
+    for problem in problems:
+        print(f"PROBLEM: {problem}")
+    if problems:
+        sys.exit(1)
+    print("EdgeOS check passed")
+
+
+def verify_bridge_tar(path: Path) -> None:
+    """The bridge is an EdgeOS-format factory tar with a kernel that fits one slot."""
+    try:
+        with tarfile.open(path) as tar:
+            names = set(tar.getnames())
+            missing = {"compat", "vmlinux.tmp", "vmlinux.tmp.md5", "squashfs.tmp", "version.tmp"} - names
+            if missing:
+                sys.exit(f"{path.name} is not an EdgeOS factory tar (missing {', '.join(sorted(missing))})")
+            required = {"compat", "vmlinux.tmp", "vmlinux.tmp.md5", "squashfs.tmp", "version.tmp"}
+            odd = sorted(m.name for m in tar.getmembers() if m.name in required and not m.isfile())
+            if odd:
+                sys.exit(f"{path.name}: {', '.join(odd)} not regular files; ubnt-upgrade would reject it")
+            members = [tar.extractfile(name) for name in ("vmlinux.tmp", "vmlinux.tmp.md5")]
+            if None in members:
+                sys.exit(f"{path.name}: vmlinux.tmp or vmlinux.tmp.md5 is not a regular file")
+            kernel = members[0].read()
+            declared = (members[1].read().split() or [b""])[0].decode(errors="replace").lower()
+    except KeyError:      # a link member pointing outside the archive
+        sys.exit(f"{path.name}: vmlinux.tmp or vmlinux.tmp.md5 is not a regular file")
+    except tarfile.TarError as error:
+        sys.exit(f"{path.name} is not a readable tar file: {error}")
+    if not kernel:
+        sys.exit(f"{path.name}: vmlinux.tmp is empty")
+    if len(kernel) > KERNEL_SLOT:
+        sys.exit(f"bridge kernel is {len(kernel)} bytes; an EdgeOS kernel slot holds {KERNEL_SLOT}")
+    if hashlib.md5(kernel).hexdigest() != declared:
+        sys.exit("bridge kernel does not match its vmlinux.tmp.md5")
+
+
+def cmd_bridge(args) -> None:
+    image = Path(args.bridge_tar)
+    verify_bridge_tar(image)
+    router = Router(args.router)
+    facts = edgeos_facts(router)
+    problems = edgeos_problems(facts)
+    if problems:
+        sys.exit("refusing, EdgeOS check failed:\n  " + "\n  ".join(problems))
+    router.upload(image, "/tmp/erx-bridge.tar")
+    # This is what "add system image" runs, without its interactive prompts.
+    # EdgeOS writes the bridge kernel to its spare kernel slot and switches
+    # the boot selector to it; the running EdgeOS is kept as the other image.
+    print(router.run("sudo /usr/bin/ubnt-upgrade --upgrade-noprompt /tmp/erx-bridge.tar"))
+    print(router.run("/opt/vyatta/bin/vyatta-op-cmd-wrapper show system image", check=False))
+    confirm("REBOOT", f"The bridge is installed on {args.router}. After the reboot it runs "
+                      "from RAM and answers on IPv6 link-local as root.",
+            cancelled="not rebooted. The bridge is already installed and the boot selector points "
+                      "to it: the next reboot or power cycle starts the bridge. EdgeOS stays in the "
+                      "other kernel slot (see 'show system image' above).")
+    router.run("sudo reboot", check=False)
+    print("rebooting; the bridge is usually reachable after about a minute")
+
+
+# ------------------------------------------------------------------ bridge
+
+def fresh_known_hosts(kind: str, router: str) -> Path:
+    """A router that just changed system has a new SSH host key; keep it apart
+    from the one EdgeOS had at the same address instead of overriding checks.
+    Learned anew on every run: flash cannot clear it in advance, because
+    OpenWrt answers on a different address than the bridge it was flashed
+    from (base MAC vs. MAC + 1). verify prints the fingerprint."""
+    path = STATE / f"known_hosts-{kind}-{hashlib.sha1(router.encode()).hexdigest()[:12]}"
+    path.unlink(missing_ok=True)
+    return path
+
+
+def check_local_inputs(image: Path, config: Path | None) -> None:
+    reading = image
+    try:
+        with tarfile.open(image, "r:") as tar:   # plain tar, as the bridge unpacks it
+            if not any(n.startswith("sysupgrade-ubnt_edgerouter-x-sfp/") for n in tar.getnames()):
+                sys.exit(f"{image.name} is not an ER-X-SFP sysupgrade image")
+        if config:
+            reading = config
+            if config.stat().st_size > CONFIG_LIMIT:  # it is staged in the bridge's RAM
+                sys.exit(f"{config.name} is larger than {CONFIG_LIMIT // MIB} MiB; keep large files out of access.tgz")
+            with tarfile.open(config, "r:gz") as tar:
+                members = tar.getmembers()
+                bad = [m.name for m in members
+                       if m.name.startswith("/") or ".." in Path(m.name).parts or "\\" in m.name]
+                if bad:
+                    sys.exit(f"{config.name} has unsafe paths: {', '.join(bad[:3])}")
+                # a link could point the next member (or the system) anywhere
+                odd = [m.name for m in members if not (m.isfile() or m.isdir())]
+                if odd:
+                    sys.exit(f"{config.name} has links or special files: {', '.join(odd[:3])}")
+    except (tarfile.TarError, OSError) as error:
+        sys.exit(f"cannot read {reading}: {error}")
+
+
+def cmd_flash(args) -> None:
+    image = Path(args.sysupgrade)
+    config = Path(args.config) if args.config else None
+    check_local_inputs(image, config)     # before tens of MB go over the link
+    router = Router(args.router, known_hosts=fresh_known_hosts("bridge", args.router))
+
+    router.upload(FLASH_SCRIPT, "/tmp/erx-flash.sh")
+    router.upload(image, "/tmp/sysupgrade.bin")
+    flash_args = f"/tmp/sysupgrade.bin {sha256(image)}"
+    if config:
+        router.upload(config, "/tmp/access.tgz")
+        flash_args += f" /tmp/access.tgz {sha256(config)}"
+
+    if router.stream(f"sh /tmp/erx-flash.sh check {flash_args}")[0] != 0:
+        sys.exit("check failed on the bridge; nothing was written")
+    confirm("FLASH", "This erases EdgeOS and writes OpenWrt. There is no remote way back "
+                     "to EdgeOS afterwards (see README, 'Rollback').")
+    # Run the writer detached from this SSH session: a dropped connection must
+    # not stop it between two writes. Then follow its log until it ends.
+    router.run(f"sh /tmp/erx-flash.sh flash {flash_args} > /tmp/erx-flash.log 2>&1 < /dev/null & "
+               "echo $! > /tmp/erx-flash.pid")
+    lost = ("the writer keeps running on the router. "
+            f"Reconnect and read /tmp/erx-flash.log on {args.router} before doing anything else")
+    try:
+        _, output = router.stream("tail -n +1 -f /tmp/erx-flash.log & t=$!; "
+                                  "while kill -0 $(cat /tmp/erx-flash.pid) 2>/dev/null; do sleep 1; done; "
+                                  "sleep 1; kill $t 2>/dev/null")
+    except KeyboardInterrupt:
+        sys.exit(f"\ninterrupted on this host only: {lost}")
+    if FLASH_DONE in output:
+        print("the router is rebooting into OpenWrt. OpenWrt's eth0 uses the router's base MAC, like "
+              "EdgeOS did, not the bridge's MAC + 1: verify with the link-local address EdgeOS had")
+    elif "ERROR:" in output:
+        sys.exit("flash stopped: read the output above and do NOT reboot the router")
+    else:
+        sys.exit(f"lost the connection while flashing; {lost}")
+
+
+# ------------------------------------------------------------------ OpenWrt
+
+def cmd_verify(args) -> None:
+    known_hosts = fresh_known_hosts("openwrt", args.router)
+    router = Router(args.router, known_hosts=known_hosts)
+    mtd = router.run("cat /proc/mtd")
+    print(router.run("cat /etc/openwrt_release; uname -r; "
+                     "for i in /sys/class/mtd/mtd*; do if [ -f $i/bad_blocks ]; then echo \"$(cat $i/name) "
+                     "bad=$(cat $i/bad_blocks) ecc=$(cat $i/ecc_failures 2>/dev/null)\"; fi; done; true") + mtd)
+    if '"kernel"' not in mtd or '"kernel1"' in mtd:
+        sys.exit("flash layout is not OpenWrt's single 6 MiB kernel layout")
+    if args.sysupgrade:  # sysupgrade -T: full image check, writes nothing
+        try:
+            router.upload(Path(args.sysupgrade), "/tmp/erx-next.bin")
+            accepted = router.stream("sysupgrade -T /tmp/erx-next.bin")[0] == 0
+        finally:  # the copy would otherwise occupy RAM (tmpfs) until the next reboot
+            router.run("rm -f /tmp/erx-next.bin", check=False)
+        if not accepted:
+            sys.exit("sysupgrade -T rejected the image")
+        print("sysupgrade -T accepts the image: later upgrades work with plain sysupgrade")
+    fingerprint = subprocess.run(["ssh-keygen", "-l", "-f", str(known_hosts)],
+                                 capture_output=True, text=True).stdout.strip()
+    host = args.router.split("@")[-1]
+    print(f"new SSH host key (now in {known_hosts}):\n  {fingerprint}")
+    print(f"your own ~/.ssh/known_hosts still holds the EdgeOS key for {host}; before a plain ssh "
+          f"login run: ssh-keygen -R '{host}' and compare the fingerprint above")
+    print("OpenWrt verified: new single-kernel flash layout")
+
+
+ACCESS_DEFAULTS = """#!/bin/sh
+# Added by erx-migrate: keep the router reachable after the migration.
+# Accept IPv6 link-local traffic arriving on the WAN port (eth0), because
+# the operator reaches the router through that port and cannot re-plug it.
+uci -q delete firewall.erx_remote_access
+uci set firewall.erx_remote_access=rule
+uci set firewall.erx_remote_access.name='Allow-IPv6-link-local-WAN'
+uci set firewall.erx_remote_access.src='wan'
+uci set firewall.erx_remote_access.src_ip='fe80::/10'
+uci set firewall.erx_remote_access.family='ipv6'
+uci set firewall.erx_remote_access.target='ACCEPT'
+uci commit firewall
+# Key-only SSH.
+i=0
+while uci -q get "dropbear.@dropbear[$i]" >/dev/null; do
+	uci set "dropbear.@dropbear[$i].PasswordAuth=0"
+	uci set "dropbear.@dropbear[$i].RootPasswordAuth=0"
+	i=$((i + 1))
+done
+uci commit dropbear
+exit 0
+"""
+
+
+def key_type(line: str) -> str | None:
+    """authorized_keys format: [options] type base64 [comment]. Options are one
+    field (spaces only inside double quotes); the comment is free text
+    (apostrophes and all), so it is not parsed."""
+    rest = line.strip()
+    if not re.match(r"(ssh|ecdsa|sk)-", rest):   # skip the options field
+        quoted, i = False, 0
+        while i < len(rest) and (quoted or not rest[i].isspace()):
+            if rest[i] == "\\":
+                i += 1
+            elif rest[i] == '"':
+                quoted = not quoted
+            i += 1
+        if quoted:
+            return None
+        rest = rest[i:].lstrip()
+    match = re.match(r"((?:ssh|ecdsa|sk)-[a-z0-9@.-]+)\s+AAAA", rest)
+    return match.group(1) if match else None
+
+
+def uci_sections(text: str) -> list[tuple[str, str, dict[str, list[str]]]]:
+    """(type, name, {option: [values]}) for each 'config' section of a UCI file."""
+    sections: list[tuple[str, str, dict[str, list[str]]]] = []
+    for line in text.splitlines():
+        try:
+            words = shlex.split(line, comments=True)
+        except ValueError:
+            continue
+        if len(words) >= 2 and words[0] == "config":
+            sections.append((words[1], words[2] if len(words) > 2 else "", {}))
+        elif len(words) >= 3 and words[0] in ("option", "list") and sections:
+            sections[-1][2].setdefault(words[1], []).append(words[2])
+    return sections
+
+
+def networks_on_eth0(sections) -> set[str]:
+    """Interfaces that carry untagged eth0 traffic: eth0 itself, a bridge with
+    eth0 as a port, or a bridge VLAN with eth0 untagged ('eth0:u', 'eth0:u*').
+    Tagged VLANs (eth0.100, 'eth0:t') do not count: the operator's link-local
+    traffic arrives untagged."""
+    def values(options, key):
+        return [word for value in options.get(key, []) for word in value.split()]
+
+    devices = {"eth0"}
+    for kind, _, options in sections:
+        if kind == "device" and "eth0" in values(options, "ports"):
+            devices.update(values(options, "name"))
+    for kind, _, options in sections:
+        if kind == "bridge-vlan" and {"eth0:u", "eth0:u*"} & set(values(options, "ports")):
+            devices.update(f"{d}.{v}" for d in values(options, "device") for v in values(options, "vlan"))
+    return {name for kind, name, options in sections if kind == "interface"
+            and devices & set(values(options, "device") + values(options, "ifname"))}
+
+
+def build_access_config(authorized_keys: Path, extra: Path | None, output: Path) -> None:
+    text = authorized_keys.read_text(encoding="utf-8", errors="replace")
+    if "PRIVATE KEY" in text:
+        sys.exit(f"{authorized_keys} contains a private key; give public keys only")
+    keys = [line.strip() for line in text.splitlines() if line.strip() and not line.strip().startswith("#")]
+    types = [key_type(key) for key in keys]
+    if None in types:
+        sys.exit(f"{authorized_keys}: not an authorized_keys line: {keys[types.index(None)][:60]}")
+    # OpenWrt's Dropbear is built without ECC and security-key support: an
+    # ECDSA or sk- key would be accepted here and then fail to log in.
+    unusable = [t for t in types if t not in ("ssh-ed25519", "ssh-rsa")]
+    if unusable:
+        sys.exit(f"{authorized_keys}: OpenWrt's Dropbear accepts only ssh-ed25519 and ssh-rsa keys, "
+                 f"found {', '.join(unusable)}")
+    if not keys:
+        sys.exit(f"{authorized_keys} has no SSH public keys")
+
+    def add(tar: tarfile.TarFile, name: str, data: bytes, mode: int) -> None:
+        info = tarfile.TarInfo(name)
+        info.size, info.mode = len(data), mode
+        tar.addfile(info, io.BytesIO(data))
+
+    if extra and not extra.is_dir():
+        sys.exit(f"--files {extra} is not a directory")
+    links = [p for p in extra.rglob("*") if p.is_symlink()] if extra else []
+    if links:  # a file link would be copied as a file, a directory link skipped
+        sys.exit(f"--files contains symbolic links ({', '.join(map(str, links[:3]))}); copy the real files in")
+    if not output.parent.is_dir():
+        sys.exit(f"-o {output}: directory {output.parent} does not exist")
+    for generated in ("etc/dropbear/authorized_keys", "etc/uci-defaults/99-erx-remote-access"):
+        if extra and (extra / generated).exists():
+            sys.exit(f"--files {extra} contains {generated}, which access-config generates; "
+                     "pass keys with --authorized-keys instead")
+    # The access rule has src='wan': eth0 must end up in the firewall zone 'wan'.
+    # Files that are not supplied keep the image defaults (eth0 is 'wan'/'wan6').
+    network = extra / "etc/config/network" if extra else None
+    firewall = extra / "etc/config/firewall" if extra else None
+    eth0_networks = ({"wan", "wan6"} if not (network and network.is_file())
+                     else networks_on_eth0(uci_sections(network.read_text(encoding="utf-8", errors="replace"))))
+    wan_networks, wan_devices = {"wan", "wan6"}, set()
+    if firewall and firewall.is_file():
+        zones = [o for t, _, o in uci_sections(firewall.read_text(encoding="utf-8", errors="replace"))
+                 if t == "zone" and o.get("name") == ["wan"]]
+        if not zones:
+            sys.exit(f"{firewall} has no zone with option name 'wan' (firewall4 takes the zone name "
+                     "from that option, not from the section name): the access rule for eth0 "
+                     "(src='wan') would not match and the router would be unreachable")
+        wan_networks = {n for o in zones for value in o.get("network", []) for n in value.split()}
+        wan_devices = {d for o in zones for value in o.get("device", []) for d in value.split()}
+    if not (eth0_networks & wan_networks or "eth0" in wan_devices):   # a zone may take the device directly
+        sys.exit(f"eth0 is not in the firewall zone 'wan' (eth0 carries {sorted(eth0_networks) or 'no interface'}, "
+                 f"zone 'wan' covers {sorted(wan_networks)}): the access rule would not match and the "
+                 "router would be unreachable")
+    with tarfile.open(output, "w:gz") as tar:
+        if extra:  # per-device files (network, olsrd, ...) laid out as on the router
+            for path in sorted(extra.rglob("*")):
+                # macOS metadata: .DS_Store and AppleDouble "._name" files
+                if path.is_file() and path.name != ".DS_Store" and not path.name.startswith("._"):
+                    mode = path.stat().st_mode  # no group/other write, whatever the host filesystem says
+                    add(tar, path.relative_to(extra).as_posix(), path.read_bytes(),
+                        mode & (0o755 if mode & 0o111 else 0o644))
+        add(tar, "etc/dropbear/authorized_keys", ("\n".join(keys) + "\n").encode(), 0o600)
+        add(tar, "etc/uci-defaults/99-erx-remote-access", ACCESS_DEFAULTS.encode(), 0o755)
+    if output.stat().st_size > CONFIG_LIMIT:
+        output.unlink()
+        sys.exit(f"access.tgz would be larger than {CONFIG_LIMIT // MIB} MiB (flash refuses it); keep large files out")
+    print(f"wrote {output} ({len(keys)} SSH keys{', plus ' + str(extra) if extra else ''})")
+
+
+def cmd_access_config(args) -> None:
+    build_access_config(Path(args.authorized_keys), Path(args.files) if args.files else None,
+                        Path(args.output))
+
+
+# --------------------------------------------------------------------- main
+
+def existing_file(value: str) -> Path:
+    path = Path(value)
+    if not path.is_file():
+        raise argparse.ArgumentTypeError(f"no such file: {value}")
+    return path
+
+
+def main(argv=None) -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("check", help="read-only EdgeOS check")
+    p.add_argument("router")
+    p.set_defaults(func=cmd_check)
+
+    p = sub.add_parser("bridge", help="install the 19.07 RAM bridge through EdgeOS and reboot")
+    p.add_argument("router")
+    p.add_argument("bridge_tar", type=existing_file)
+    p.set_defaults(func=cmd_bridge)
+
+    p = sub.add_parser("flash", help="from the bridge: write OpenWrt and reboot")
+    p.add_argument("router")
+    p.add_argument("sysupgrade", type=existing_file)
+    p.add_argument("--config", type=existing_file, help="access.tgz from 'access-config', restored on first boot")
+    p.set_defaults(func=cmd_flash)
+
+    p = sub.add_parser("verify", help="read-only check of the migrated OpenWrt")
+    p.add_argument("router")
+    p.add_argument("sysupgrade", nargs="?", type=existing_file, help="optional image to test with sysupgrade -T")
+    p.set_defaults(func=cmd_verify)
+
+    p = sub.add_parser("access-config", help="build the first-boot config that keeps the router reachable")
+    p.add_argument("--authorized-keys", required=True, type=existing_file)
+    p.add_argument("--files", help="optional directory of extra files, e.g. etc/config/network")
+    p.add_argument("-o", "--output", required=True)
+    p.set_defaults(func=cmd_access_config)
+
+    args = parser.parse_args(argv)
+    if not FLASH_SCRIPT.is_file():
+        parser.error(f"{FLASH_SCRIPT} is missing: run erx-migrate from a complete release2 directory")
+    router = getattr(args, "router", "")
+    if args.command in ("flash", "verify") and not router.startswith("root@"):
+        parser.error(f"{args.command} logs in as root: use root@ADDRESS")
+    if args.command in ("check", "bridge") and "@" not in router:
+        parser.error(f"{args.command} needs the EdgeOS user, e.g. ubnt@ADDRESS")
+    host = router.split("@")[-1]
+    if host.startswith("["):
+        parser.error(f"{host}: give the bare address; ssh takes no [address]:port (a port goes into ~/.ssh/config)")
+    if host.lower().startswith("fe80:") and "%" not in host:
+        parser.error(f"{host} is link-local: add the host's interface, e.g. {host}%eth0")
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

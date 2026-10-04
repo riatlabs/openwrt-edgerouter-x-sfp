@@ -1,0 +1,12 @@
+.DS_Store
+.pytest_cache/
+__pycache__/
+*.py[cod]
+/build/work/
+/build/out/
+/access.tgz
+/bridge.tar
+/sysupgrade.bin
+/admins.pub
+/keys.pub
+/backups/
