@@ -70,6 +70,10 @@ OpenWrt installation uses its keys and disables SSH password login.
 
 ## Migrating one router
 
+**If your access uses a PoE-powered antenna, explicitly enable its PoE port
+in both the bridge build and `access-config` before migrating.** Follow
+[PoE and access through neighbouring nodes](#poe-and-access-through-neighbouring-nodes).
+
 ```sh
 # 0. once: the first-boot config that keeps OpenWrt reachable on eth0
 #    (ssh-ed25519 or ssh-rsa keys only: OpenWrt's Dropbear has no ECDSA;
@@ -149,8 +153,14 @@ management ports up with IPv6 enabled. A routed connection through an antenna
 needs a configured address and routes; link-local addresses stay on one
 Layer-2 segment. SFP (`eth5`) access has not been verified.
 
-Passive PoE on `eth0`–`eth4` defaults to off. To enable selected outputs,
-use the same comma-separated port list for the bridge and the final config:
+**Passive PoE on `eth0`–`eth4` defaults to off and must be explicitly enabled
+for every port that needs to power an antenna.** The EdgeOS PoE settings are
+not copied automatically. Before installing the bridge, use the same
+comma-separated port list in **both** commands below. Omitting `--poe-ports`
+leaves the outputs off in that stage; enabling PoE only in the final config
+does not power the antenna while the bridge is running.
+
+For an antenna powered through `eth4`:
 
 ```sh
 printf '%s\n' 'your-chosen-bridge-password' | build/build.sh bridge --poe-ports eth4
