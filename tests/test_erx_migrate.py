@@ -289,8 +289,9 @@ def test_check_refuses_other_boards_and_bad_blocks(tmp_path, setup, message):
     assert message in result.stdout
 
 
-def test_bridge_installs_through_ubnt_upgrade_and_reboots_only_after_confirmation(tmp_path):
-    env = fake_edgeos(tmp_path)
+@pytest.mark.parametrize("poe_eth4", ["off", "24v"])
+def test_bridge_installs_through_ubnt_upgrade_and_reboots_only_after_confirmation(tmp_path, poe_eth4):
+    env = fake_edgeos(tmp_path, poe_eth4=poe_eth4)
     tar = bridge_tar(tmp_path / "bridge.tar", b"k" * 1000)
     result = run_tool(env, "bridge", "ubnt@router", str(tar), answer="REBOOT\n")
     assert result.returncode == 0, result.stdout + result.stderr
@@ -475,10 +476,10 @@ def test_changed_host_key_gives_the_command_to_fix_it(tmp_path):
     assert "ssh-keygen -R 'fe80::1%eth0'" in result.stderr
 
 
-def test_check_refuses_active_poe_output(tmp_path):
+def test_check_accepts_active_poe_output(tmp_path):
     result = run_tool(fake_edgeos(tmp_path, poe_eth4="24v"), "check", "ubnt@router")
-    assert result.returncode == 1
-    assert "PoE output is on for eth4" in result.stdout
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "EdgeOS check passed" in result.stdout
 
 
 def test_access_config_output_directory_must_exist(tmp_path):

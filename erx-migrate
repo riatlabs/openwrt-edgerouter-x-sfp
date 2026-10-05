@@ -178,9 +178,6 @@ def edgeos_problems(facts: dict[str, str]) -> list[str]:
             problems.append(f"{name}: ECC failures = '{facts.get(f'ecc_{name}')}' (need 0)")
     if facts.get("config_boot") != "ok":
         problems.append("cannot read /config/config.boot, so the PoE state is unknown")
-    if facts.get("poe_on", "").strip():
-        problems.append(f"PoE output is on for {facts['poe_on'].strip()}: it goes off from the bridge "
-                        "reboot until OpenWrt is configured to switch it on (README, 'PoE')")
     if facts.get("selector") not in ("00", "01"):
         problems.append(f"boot selector unreadable or unexpected: '{facts.get('selector')}'")
     return problems

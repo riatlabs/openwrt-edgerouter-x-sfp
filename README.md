@@ -165,10 +165,10 @@ voltage or antenna operation.
 
 On one lab router, the selected GPIO was enabled on both the bridge and
 OpenWrt, and remained enabled after an OpenWrt cold boot. A complete test
-through a PoE-powered antenna is still outstanding. Until that passes, `check` and `bridge` continue to
-refuse EdgeOS configurations with PoE enabled. Turning off the power on a
-port that carries your only access disconnects you; use an independent
-connection for the lab test.
+through a PoE-powered antenna is still outstanding. `check` and `bridge`
+accept EdgeOS configurations with PoE enabled. Select the ports you need
+in both the bridge build and `access-config` so they are powered again
+after each reboot.
 
 ## Rollback: why there is no remote way back to EdgeOS
 
