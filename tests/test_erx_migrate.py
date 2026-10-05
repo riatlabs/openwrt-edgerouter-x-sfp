@@ -289,8 +289,9 @@ def test_check_refuses_other_boards_and_bad_blocks(tmp_path, setup, message):
     assert message in result.stdout
 
 
-def test_bridge_installs_through_ubnt_upgrade_and_reboots_only_after_confirmation(tmp_path):
-    env = fake_edgeos(tmp_path)
+@pytest.mark.parametrize("poe_eth4", ["off", "24v"])
+def test_bridge_installs_through_ubnt_upgrade_and_reboots_only_after_confirmation(tmp_path, poe_eth4):
+    env = fake_edgeos(tmp_path, poe_eth4=poe_eth4)
     tar = bridge_tar(tmp_path / "bridge.tar", b"k" * 1000)
     result = run_tool(env, "bridge", "ubnt@router", str(tar), answer="REBOOT\n")
     assert result.returncode == 0, result.stdout + result.stderr
@@ -475,10 +476,10 @@ def test_changed_host_key_gives_the_command_to_fix_it(tmp_path):
     assert "ssh-keygen -R 'fe80::1%eth0'" in result.stderr
 
 
-def test_check_refuses_active_poe_output(tmp_path):
+def test_check_accepts_active_poe_output(tmp_path):
     result = run_tool(fake_edgeos(tmp_path, poe_eth4="24v"), "check", "ubnt@router")
-    assert result.returncode == 1
-    assert "PoE output is on for eth4" in result.stdout
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "EdgeOS check passed" in result.stdout
 
 
 def test_access_config_output_directory_must_exist(tmp_path):
@@ -513,7 +514,8 @@ def test_socket_dir_is_made_private(monkeypatch):
         shutil.rmtree(state)
 
 
-@pytest.mark.parametrize("clash", ["etc/dropbear/authorized_keys", "etc/uci-defaults/99-erx-remote-access"])
+@pytest.mark.parametrize("clash", ["etc/dropbear/authorized_keys", "etc/uci-defaults/99-erx-remote-access",
+                                   "etc/init.d/gpio_switch"])
 def test_access_config_refuses_files_it_generates_itself(tmp_path, clash):
     keys = tmp_path / "keys"
     keys.write_text("ssh-ed25519 AAAAC3 ok\n")
@@ -766,3 +768,26 @@ def test_config_with_backslash_names_is_refused(tmp_path):
     make_image(image, b"k", b"r")
     with pytest.raises(SystemExit, match="unsafe paths"):
         erx.check_local_inputs(image, tgz_with(tmp_path / "a.tgz", "etc\\config\\network"))
+
+
+def test_access_config_poe_uses_the_shared_helper(tmp_path):
+    keys = tmp_path / "keys"
+    keys.write_text("ssh-ed25519 AAAA test\n")
+    out = tmp_path / "access.tgz"
+    erx.build_access_config(keys, None, out, erx.poe_ports("eth4,eth1,eth4"))
+    with tarfile.open(out) as tar:
+        helper = tar.extractfile("usr/lib/erx-migrate/poe-setup.sh").read()
+        boot = tar.extractfile("etc/uci-defaults/98-erx-poe").read().decode()
+        service = tar.extractfile("etc/init.d/gpio_switch").read()
+        assert tar.getmember("etc/init.d/gpio_switch").mode == 0o755
+    assert helper == (TOOL.parent / "build/poe-setup.sh").read_bytes()
+    assert service == (TOOL.parent / "build/gpio-switch.sh").read_bytes()
+    assert boot.endswith("eth4 eth1\n")
+    assert "src='*'" in erx.ACCESS_DEFAULTS
+    assert "dest_port='22'" in erx.ACCESS_DEFAULTS
+
+
+@pytest.mark.parametrize("ports", ["eth5", "eth4,", "eth4;reboot", "all"])
+def test_access_config_bad_poe_ports_are_refused(ports):
+    with pytest.raises(Exception, match="PoE ports"):
+        erx.poe_ports(ports)

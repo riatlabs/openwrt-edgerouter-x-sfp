@@ -80,3 +80,21 @@ def test_every_seed_selects_its_device_and_has_unix_line_endings():
         assert b"\r" not in seed
         assert profile in seed.decode().splitlines(), kind
     assert "CONFIG_PACKAGE_nand-utils=y" in (build / "recovery.seed").read_text().splitlines()
+
+
+@pytest.mark.parametrize("ports", ["eth5", "eth4,", "eth4;reboot", "all"])
+def test_bridge_refuses_invalid_poe_ports(tmp_path, ports):
+    result = subprocess.run(["bash", str(BUILD), "bridge", "--poe-ports", ports],
+                            input="secret\n", capture_output=True, text=True)
+    assert result.returncode != 0 and "PoE ports must" in result.stderr
+
+
+def test_bridge_accepts_selected_poe_ports(tmp_path):
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    (fake / "uname").write_text("#!/bin/sh\necho NotLinux\n")
+    (fake / "uname").chmod(0o755)
+    result = subprocess.run(["bash", str(BUILD), "bridge", "--poe-ports", "eth1,eth4"],
+                            input="secret\n", capture_output=True, text=True,
+                            env={**os.environ, "PATH": f"{fake}:{os.environ['PATH']}"})
+    assert "OpenWrt builds need Linux" in result.stderr
