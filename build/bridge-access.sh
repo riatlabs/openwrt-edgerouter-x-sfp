@@ -21,4 +21,23 @@ uci set firewall.bridge_link_local.src_ip='fe80::/10'
 uci set firewall.bridge_link_local.family='ipv6'
 uci set firewall.bridge_link_local.target='ACCEPT'
 uci commit firewall
+# LAN and WAN keep their separate networks; SSH is accepted from either.
+uci -q delete firewall.bridge_ssh
+uci set firewall.bridge_ssh=rule
+uci set firewall.bridge_ssh.name='Allow-SSH-link-local'
+uci set firewall.bridge_ssh.src='*'
+uci set firewall.bridge_ssh.src_ip='fe80::/10'
+uci set firewall.bridge_ssh.family='ipv6'
+uci set firewall.bridge_ssh.proto='tcp'
+uci set firewall.bridge_ssh.dest_port='22'
+uci set firewall.bridge_ssh.target='ACCEPT'
+uci commit firewall
+
+if [ -s /etc/erx-migrate/poe-ports ]; then
+    # Port names were validated by build.sh; the helper validates again.
+    ports=$(cat /etc/erx-migrate/poe-ports) || exit 1
+    # Intentional splitting of the validated, space-separated port names.
+    # shellcheck disable=SC2086
+    sh /usr/lib/erx-migrate/poe-setup.sh $ports || exit 1
+fi
 exit 0

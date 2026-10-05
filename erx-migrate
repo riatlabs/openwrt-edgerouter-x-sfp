@@ -367,6 +367,17 @@ uci set firewall.erx_remote_access.src_ip='fe80::/10'
 uci set firewall.erx_remote_access.family='ipv6'
 uci set firewall.erx_remote_access.target='ACCEPT'
 uci commit firewall
+# SSH from LAN, WAN and custom zones on active IPv6 interfaces.
+uci -q delete firewall.erx_ssh
+uci set firewall.erx_ssh=rule
+uci set firewall.erx_ssh.name='Allow-SSH-link-local'
+uci set firewall.erx_ssh.src='*'
+uci set firewall.erx_ssh.src_ip='fe80::/10'
+uci set firewall.erx_ssh.family='ipv6'
+uci set firewall.erx_ssh.proto='tcp'
+uci set firewall.erx_ssh.dest_port='22'
+uci set firewall.erx_ssh.target='ACCEPT'
+uci commit firewall
 # Key-only SSH.
 i=0
 while uci -q get "dropbear.@dropbear[$i]" >/dev/null; do
@@ -433,7 +444,17 @@ def networks_on_eth0(sections) -> set[str]:
             and devices & set(values(options, "device") + values(options, "ifname"))}
 
 
-def build_access_config(authorized_keys: Path, extra: Path | None, output: Path) -> None:
+def poe_ports(value: str) -> tuple[str, ...]:
+    ports = value.split(",")
+    if any(port not in {f"eth{i}" for i in range(5)} for port in ports):
+        raise argparse.ArgumentTypeError("PoE ports must be eth0 through eth4, comma-separated")
+    return tuple(dict.fromkeys(ports))
+
+
+def build_access_config(authorized_keys: Path, extra: Path | None, output: Path,
+                        ports: tuple[str, ...] = ()) -> None:
+    if any(port not in {f"eth{i}" for i in range(5)} for port in ports):
+        sys.exit("PoE ports must be eth0 through eth4")
     text = authorized_keys.read_text(encoding="utf-8", errors="replace")
     if "PRIVATE KEY" in text:
         sys.exit(f"{authorized_keys} contains a private key; give public keys only")
@@ -462,7 +483,8 @@ def build_access_config(authorized_keys: Path, extra: Path | None, output: Path)
         sys.exit(f"--files contains symbolic links ({', '.join(map(str, links[:3]))}); copy the real files in")
     if not output.parent.is_dir():
         sys.exit(f"-o {output}: directory {output.parent} does not exist")
-    for generated in ("etc/dropbear/authorized_keys", "etc/uci-defaults/99-erx-remote-access"):
+    for generated in ("etc/dropbear/authorized_keys", "etc/uci-defaults/99-erx-remote-access",
+                      "etc/uci-defaults/98-erx-poe", "usr/lib/erx-migrate/poe-setup.sh"):
         if extra and (extra / generated).exists():
             sys.exit(f"--files {extra} contains {generated}, which access-config generates; "
                      "pass keys with --authorized-keys instead")
@@ -494,6 +516,11 @@ def build_access_config(authorized_keys: Path, extra: Path | None, output: Path)
                     mode = path.stat().st_mode  # no group/other write, whatever the host filesystem says
                     add(tar, path.relative_to(extra).as_posix(), path.read_bytes(),
                         mode & (0o755 if mode & 0o111 else 0o644))
+        if ports:
+            add(tar, "usr/lib/erx-migrate/poe-setup.sh",
+                (HERE / "build/poe-setup.sh").read_bytes(), 0o755)
+            script = "#!/bin/sh\nsh /usr/lib/erx-migrate/poe-setup.sh " + " ".join(ports) + "\n"
+            add(tar, "etc/uci-defaults/98-erx-poe", script.encode(), 0o755)
         add(tar, "etc/dropbear/authorized_keys", ("\n".join(keys) + "\n").encode(), 0o600)
         add(tar, "etc/uci-defaults/99-erx-remote-access", ACCESS_DEFAULTS.encode(), 0o755)
     if output.stat().st_size > CONFIG_LIMIT:
@@ -504,7 +531,7 @@ def build_access_config(authorized_keys: Path, extra: Path | None, output: Path)
 
 def cmd_access_config(args) -> None:
     build_access_config(Path(args.authorized_keys), Path(args.files) if args.files else None,
-                        Path(args.output))
+                        Path(args.output), args.poe_ports)
 
 
 # --------------------------------------------------------------------- main
@@ -543,6 +570,8 @@ def main(argv=None) -> None:
     p = sub.add_parser("access-config", help="build the first-boot config that keeps the router reachable")
     p.add_argument("--authorized-keys", required=True, type=existing_file)
     p.add_argument("--files", help="optional directory of extra files, e.g. etc/config/network")
+    p.add_argument("--poe-ports", type=poe_ports, default=(),
+                   help="experimental: enable passive PoE on these ports, e.g. eth1,eth4")
     p.add_argument("-o", "--output", required=True)
     p.set_defaults(func=cmd_access_config)
 

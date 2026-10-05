@@ -3,6 +3,7 @@
 #
 #   ./build.sh bridge   OpenWrt 19.07.10 RAM bridge (EdgeOS factory tar)
 #                       root password from stdin, optional --authorized-keys FILE
+#                       experimental --poe-ports eth1,eth4
 #   ./build.sh final    OpenWrt 25.12.5 sysupgrade image with OLSR v1/v2
 #                       (optional: an official 25.12 sysupgrade image works too)
 #   ./build.sh recovery OpenWrt 25.12.5 RAM recovery image for recovery/ (lab)
@@ -44,11 +45,24 @@ if [[ "$KIND" == bridge ]]; then
     # The bridge's only job is remote access after the EdgeOS reboot:
     # root login over IPv6 link-local on the WAN port (eth0).
     AUTHORIZED_KEYS=""
-    if [[ "${1:-}" == --authorized-keys ]]; then
-        [[ -n "${2:-}" ]] || die "--authorized-keys needs a file"
-        AUTHORIZED_KEYS="$2"; shift 2
+    POE_PORTS=""
+    while [[ "$#" -gt 0 ]]; do
+        case "$1" in
+            --authorized-keys)
+                [[ -n "${2:-}" ]] || die "--authorized-keys needs a file"
+                AUTHORIZED_KEYS="$2"; shift 2 ;;
+            --poe-ports)
+                [[ -n "${2:-}" ]] || die "--poe-ports needs a comma-separated port list"
+                POE_PORTS="$2"; shift 2 ;;
+            *) die "unknown argument: $1" ;;
+        esac
+    done
+    if [[ -n "$POE_PORTS" ]]; then
+        [[ "$POE_PORTS" =~ ^eth[0-4](,eth[0-4])*$ ]] || die "PoE ports must be eth0 through eth4, comma-separated"
+        mkdir -p "$FILES/etc/erx-migrate" "$FILES/usr/lib/erx-migrate"
+        printf '%s\n' "${POE_PORTS//,/ }" > "$FILES/etc/erx-migrate/poe-ports"
+        cp "$HERE/poe-setup.sh" "$FILES/usr/lib/erx-migrate/poe-setup.sh"
     fi
-    [[ -z "${AUTHORIZED_KEYS}" && "${1:-}" != "" ]] && die "unknown argument: $1"
     command -v openssl >/dev/null || die "missing tool: openssl"
     [[ ! -t 0 ]] || die "pipe your chosen bridge root password on stdin, e.g. printf '%s\n' chosen-password | ./build.sh bridge"
     IFS= read -r password || true

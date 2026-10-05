@@ -139,25 +139,36 @@ on the bridge runs detached from the SSH session and logs to
 - Future upgrades: plain `sysupgrade` (`verify` runs `sysupgrade -T` on the
   image you give it; tested with the official 25.12.5 image).
 
-## PoE
+## PoE and access through neighbouring nodes
 
-The ER-X-SFP can feed passive PoE on `eth0`–`eth4`. EdgeOS keeps its PoE
-setting in its configuration; the bridge and OpenWrt start with every PoE
-output **off**. A device powered by the router (an antenna, the neighbour
-you reach the router through) goes dark at the bridge reboot. `check` and
-`bridge` therefore refuse a router whose EdgeOS has a PoE output on. To
-migrate it anyway, first make sure your access does not depend on that
-power, switch the output off in EdgeOS, and put a first-boot script into
-`access.tgz` (`--files DIR` with `DIR/etc/uci-defaults/90-poe`) that turns it
-on again in OpenWrt, e.g. for `eth4`:
+The default networks keep `eth0` in WAN and `eth1`–`eth4` in LAN. The bridge
+and `access.tgz` allow SSH on TCP port 22 from IPv6 link-local addresses in
+all firewall zones. The LAN ports use the LAN bridge's link-local address;
+it can differ from WAN's address. Custom network files must keep the chosen
+management ports up with IPv6 enabled. A routed connection through an antenna
+needs a configured address and routes; link-local addresses stay on one
+Layer-2 segment. SFP (`eth5`) access has not been verified.
+
+Passive PoE on `eth0`–`eth4` defaults to off. To enable selected outputs,
+use the same comma-separated port list for the bridge and the final config:
 
 ```sh
-uci set system.poe_power_port4.value='1' && uci commit system
+printf '%s\n' 'your-chosen-bridge-password' | build/build.sh bridge --poe-ports eth4
+./erx-migrate access-config --authorized-keys ~/.ssh/admins.pub --poe-ports eth4 -o access.tgz
 ```
 
-(`poe_power_port0`…`4` are OpenWrt's switches for `eth0`…`eth4`, GPIOs
-608–612. On hardware they exist when first-boot scripts run, so the `uci set`
-works; switching an output on has not been tested.)
+Only select ports connected to equipment that supports the router's passive
+PoE. The startup helper uses the board's GPIO configuration, enables the
+selected ports and checks the GPIO readback. An antenna may lose power during
+a reboot and needs time to start again. GPIO readback alone does not prove
+voltage or antenna operation.
+
+On one lab router, the selected GPIO was enabled on both the bridge and
+OpenWrt, and remained enabled after an OpenWrt cold boot. A complete test
+through a PoE-powered antenna is still outstanding. Until that passes, `check` and `bridge` continue to
+refuse EdgeOS configurations with PoE enabled. Turning off the power on a
+port that carries your only access disconnects you; use an independent
+connection for the lab test.
 
 ## Rollback: why there is no remote way back to EdgeOS
 

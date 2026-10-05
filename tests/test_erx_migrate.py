@@ -766,3 +766,23 @@ def test_config_with_backslash_names_is_refused(tmp_path):
     make_image(image, b"k", b"r")
     with pytest.raises(SystemExit, match="unsafe paths"):
         erx.check_local_inputs(image, tgz_with(tmp_path / "a.tgz", "etc\\config\\network"))
+
+
+def test_access_config_poe_uses_the_shared_helper(tmp_path):
+    keys = tmp_path / "keys"
+    keys.write_text("ssh-ed25519 AAAA test\n")
+    out = tmp_path / "access.tgz"
+    erx.build_access_config(keys, None, out, erx.poe_ports("eth4,eth1,eth4"))
+    with tarfile.open(out) as tar:
+        helper = tar.extractfile("usr/lib/erx-migrate/poe-setup.sh").read()
+        boot = tar.extractfile("etc/uci-defaults/98-erx-poe").read().decode()
+    assert helper == (TOOL.parent / "build/poe-setup.sh").read_bytes()
+    assert boot.endswith("eth4 eth1\n")
+    assert "src='*'" in erx.ACCESS_DEFAULTS
+    assert "dest_port='22'" in erx.ACCESS_DEFAULTS
+
+
+@pytest.mark.parametrize("ports", ["eth5", "eth4,", "eth4;reboot", "all"])
+def test_access_config_bad_poe_ports_are_refused(ports):
+    with pytest.raises(Exception, match="PoE ports"):
+        erx.poe_ports(ports)
