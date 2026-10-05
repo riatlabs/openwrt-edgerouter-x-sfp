@@ -514,7 +514,8 @@ def test_socket_dir_is_made_private(monkeypatch):
         shutil.rmtree(state)
 
 
-@pytest.mark.parametrize("clash", ["etc/dropbear/authorized_keys", "etc/uci-defaults/99-erx-remote-access"])
+@pytest.mark.parametrize("clash", ["etc/dropbear/authorized_keys", "etc/uci-defaults/99-erx-remote-access",
+                                   "etc/init.d/gpio_switch"])
 def test_access_config_refuses_files_it_generates_itself(tmp_path, clash):
     keys = tmp_path / "keys"
     keys.write_text("ssh-ed25519 AAAAC3 ok\n")
@@ -777,7 +778,10 @@ def test_access_config_poe_uses_the_shared_helper(tmp_path):
     with tarfile.open(out) as tar:
         helper = tar.extractfile("usr/lib/erx-migrate/poe-setup.sh").read()
         boot = tar.extractfile("etc/uci-defaults/98-erx-poe").read().decode()
+        service = tar.extractfile("etc/init.d/gpio_switch").read()
+        assert tar.getmember("etc/init.d/gpio_switch").mode == 0o755
     assert helper == (TOOL.parent / "build/poe-setup.sh").read_bytes()
+    assert service == (TOOL.parent / "build/gpio-switch.sh").read_bytes()
     assert boot.endswith("eth4 eth1\n")
     assert "src='*'" in erx.ACCESS_DEFAULTS
     assert "dest_port='22'" in erx.ACCESS_DEFAULTS

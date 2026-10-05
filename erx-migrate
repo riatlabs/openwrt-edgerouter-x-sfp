@@ -481,7 +481,8 @@ def build_access_config(authorized_keys: Path, extra: Path | None, output: Path,
     if not output.parent.is_dir():
         sys.exit(f"-o {output}: directory {output.parent} does not exist")
     for generated in ("etc/dropbear/authorized_keys", "etc/uci-defaults/99-erx-remote-access",
-                      "etc/uci-defaults/98-erx-poe", "usr/lib/erx-migrate/poe-setup.sh"):
+                      "etc/uci-defaults/98-erx-poe", "usr/lib/erx-migrate/poe-setup.sh",
+                      "etc/init.d/gpio_switch"):
         if extra and (extra / generated).exists():
             sys.exit(f"--files {extra} contains {generated}, which access-config generates; "
                      "pass keys with --authorized-keys instead")
@@ -514,6 +515,8 @@ def build_access_config(authorized_keys: Path, extra: Path | None, output: Path,
                     add(tar, path.relative_to(extra).as_posix(), path.read_bytes(),
                         mode & (0o755 if mode & 0o111 else 0o644))
         if ports:
+            add(tar, "etc/init.d/gpio_switch",
+                (HERE / "build/gpio-switch.sh").read_bytes(), 0o755)
             add(tar, "usr/lib/erx-migrate/poe-setup.sh",
                 (HERE / "build/poe-setup.sh").read_bytes(), 0o755)
             script = "#!/bin/sh\nsh /usr/lib/erx-migrate/poe-setup.sh " + " ".join(ports) + "\n"

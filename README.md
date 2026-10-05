@@ -169,7 +169,13 @@ printf '%s\n' 'your-chosen-bridge-password' | build/build.sh bridge --poe-ports 
 
 Only select ports connected to equipment that supports the router's passive
 PoE. The startup helper uses the board's GPIO configuration, enables the
-selected ports and checks the GPIO readback. An antenna may lose power during
+selected ports and checks the GPIO readback. The GPIO start service enables
+PoE ports in board configuration order (`eth0` to `eth4` by default), with
+a **0.5-second pause between enabled outputs**, on first boot and every
+subsequent boot or service restart. Disabled ports add no pause. This also
+applies to the RAM bridge. Rebuild the bridge and regenerate `access.tgz`
+to include this service; older artifacts do not provide the staggered start.
+An antenna may lose power during
 a reboot and needs time to start again. GPIO readback alone does not prove
 voltage or antenna operation.
 

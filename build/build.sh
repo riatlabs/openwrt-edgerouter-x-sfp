@@ -59,9 +59,10 @@ if [[ "$KIND" == bridge ]]; then
     done
     if [[ -n "$POE_PORTS" ]]; then
         [[ "$POE_PORTS" =~ ^eth[0-4](,eth[0-4])*$ ]] || die "PoE ports must be eth0 through eth4, comma-separated"
-        mkdir -p "$FILES/etc/erx-migrate" "$FILES/usr/lib/erx-migrate"
+        mkdir -p "$FILES/etc/erx-migrate" "$FILES/usr/lib/erx-migrate" "$FILES/etc/init.d"
         printf '%s\n' "${POE_PORTS//,/ }" > "$FILES/etc/erx-migrate/poe-ports"
         cp "$HERE/poe-setup.sh" "$FILES/usr/lib/erx-migrate/poe-setup.sh"
+        cp "$HERE/gpio-switch.sh" "$FILES/etc/init.d/gpio_switch"
     fi
     command -v openssl >/dev/null || die "missing tool: openssl"
     [[ ! -t 0 ]] || die "pipe your chosen bridge root password on stdin, e.g. printf '%s\n' chosen-password | ./build.sh bridge"
